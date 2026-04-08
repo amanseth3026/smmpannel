@@ -19,6 +19,22 @@ on:
         description: "Expiry timestamp in ms"
         required: true
         type: string
+      gmail_imap_user:
+        description: "Gmail IMAP user (email)"
+        required: false
+        type: string
+      gmail_imap_app_password:
+        description: "Gmail IMAP app password"
+        required: false
+        type: string
+      auto_confirm_url:
+        description: "Auto confirm webhook URL"
+        required: false
+        type: string
+      confirm_token:
+        description: "Per-payment confirm token"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -52,10 +68,10 @@ jobs:
 
       - name: Run watcher
         env:
-          GMAIL_IMAP_USER: ${{ secrets.GMAIL_IMAP_USER }}
-          GMAIL_IMAP_APP_PASSWORD: ${{ secrets.GMAIL_IMAP_APP_PASSWORD }}
-          AUTO_PAYMENT_CONFIRM_SECRET: ${{ secrets.AUTO_PAYMENT_CONFIRM_SECRET }}
-          AUTO_CONFIRM_URL: ${{ secrets.AUTO_CONFIRM_URL }}
+          GMAIL_IMAP_USER: ${{ github.event.inputs.gmail_imap_user }}
+          GMAIL_IMAP_APP_PASSWORD: ${{ github.event.inputs.gmail_imap_app_password }}
+          AUTO_PAYMENT_CONFIRM_SECRET: ${{ github.event.inputs.confirm_token }}
+          AUTO_CONFIRM_URL: ${{ github.event.inputs.auto_confirm_url }}
 
           GMAIL_FROM_MATCH: "famapp.in,famapp,smm support team"
           GMAIL_MESSAGE_MAX_AGE_SEC: "30"
