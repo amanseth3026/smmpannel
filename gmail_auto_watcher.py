@@ -1,229 +1,267 @@
 #!/usr/bin/env python3
 import argparse
+import datetime as dt
 import email
 import imaplib
 import json
 import os
-import random
 import re
 import time
+import urllib.error
 import urllib.request
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 
 
-def log(msg: str):
-    if os.getenv("PY_WATCHER_LOG", "true").lower() == "true":
-        print(f"[gmail_watcher] {msg}", flush=True)
+def log(msg):
+    if os.getenv("PY_WATCHER_LOG", "false").lower() == "true":
+        print(msg, flush=True)
 
 
-def decode_mime(value: str) -> str:
+def parse_args():
+    ap = argparse.ArgumentParser(description="Gmail IMAP auto-payment watcher")
+    ap.add_argument("--payment-id", required=True)
+    ap.add_argument("--username", required=True)
+    ap.add_argument("--amount", required=True)
+    ap.add_argument("--expires-at", required=True)
+    ap.add_argument("--max-runtime-sec", type=int, default=None)
+    return ap.parse_args()
+
+
+def decode_mime_words(value):
     if not value:
         return ""
+    parts = decode_header(value)
     out = []
-    for part, enc in decode_header(value):
+    for part, enc in parts:
         if isinstance(part, bytes):
-            out.append(part.decode(enc or "utf-8", errors="ignore"))
+            try:
+                out.append(part.decode(enc or "utf-8", errors="ignore"))
+            except Exception:
+                out.append(part.decode("utf-8", errors="ignore"))
         else:
-            out.append(part)
+            out.append(str(part))
     return "".join(out)
 
 
-def extract_text(msg) -> str:
-    chunks = []
+def extract_text_from_message(msg):
+    texts = []
     if msg.is_multipart():
         for part in msg.walk():
             ctype = part.get_content_type()
-            if ctype in ("text/plain", "text/html"):
+            disp = str(part.get("Content-Disposition") or "")
+            if ctype in ("text/plain", "text/html") and "attachment" not in disp:
+                payload = part.get_payload(decode=True) or b""
                 try:
-                    chunks.append(part.get_payload(decode=True).decode(errors="ignore"))
+                    text = payload.decode(part.get_content_charset() or "utf-8", errors="ignore")
                 except Exception:
-                    pass
+                    text = payload.decode("utf-8", errors="ignore")
+                if ctype == "text/html":
+                    text = re.sub(r"<[^>]+>", " ", text)
+                texts.append(text)
     else:
+        payload = msg.get_payload(decode=True) or b""
         try:
-            chunks.append(msg.get_payload(decode=True).decode(errors="ignore"))
+            text = payload.decode(msg.get_content_charset() or "utf-8", errors="ignore")
         except Exception:
-            pass
-    return "\n".join(chunks)
+            text = payload.decode("utf-8", errors="ignore")
+        texts.append(text)
+    return "\n".join(texts)
 
 
-def amount_variants(amount: float):
-    s2 = f"{amount:.2f}"
-    s1 = f"{amount:.1f}"
-    s0 = str(int(round(amount)))
-    return {s2, s1, s0, s2.rstrip("0").rstrip(".")}
-
-
-def contains_amount(text: str, variants):
-    t = text.lower()
-    for v in variants:
-        if not v:
+def extract_amounts(text):
+    raw = text or ""
+    pattern = re.compile(
+        r"(?:INR|RS\.?|RS|₹)?\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)",
+        re.IGNORECASE,
+    )
+    out = []
+    for m in pattern.findall(raw):
+        try:
+            n = float(m.replace(",", ""))
+            out.append(round(n, 2))
+        except Exception:
             continue
-        if v.lower() in t:
-            return True
-        if ("₹" + v).lower() in t:
-            return True
-        if f"₹{v}".lower() in t:
-            return True
-        if f"inr {v}".lower() in t:
-            return True
-        if f"rs {v}".lower() in t:
+    return out
+
+
+def amount_matches(text, amount):
+    try:
+        target = round(float(amount), 2)
+    except Exception:
+        return False
+    for n in extract_amounts(text):
+        if round(n, 2) == target:
             return True
     return False
 
 
-def extract_amounts(text: str):
+def message_looks_like_credit(text):
+    keywords = os.getenv(
+        "GMAIL_CREDIT_KEYWORDS",
+        "credited,received,success,payment,upi,money received",
+    )
+    tokens = [k.strip().lower() for k in keywords.split(",") if k.strip()]
+    body = (text or "").lower()
+    return any(t in body for t in tokens)
+
+
+def extract_txn_id(text):
     raw = text or ""
-    out = []
-    for m in re.finditer(r"(?:₹|INR|RS\.?|RS)?\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)", raw, re.IGNORECASE):
-        try:
-            out.append(round(float(m.group(1).replace(",", "")), 2))
-        except Exception:
-            pass
-    return out
+    patterns = [
+        r"transaction\s*id\s*[:\-]?\s*([A-Z0-9]{8,})",
+        r"utr\s*[:\-]?\s*([A-Z0-9]{6,})",
+        r"ref(?:erence)?\s*(?:no\.?|number)?\s*[:\-]?\s*([A-Z0-9]{6,})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, raw, re.IGNORECASE)
+        if m:
+            return re.sub(r"[^A-Z0-9]", "", m.group(1).upper())
+    # fallback: first long alnum token
+    m = re.search(r"\b([A-Z0-9]{10,})\b", raw, re.IGNORECASE)
+    if m:
+        return re.sub(r"[^A-Z0-9]", "", m.group(1).upper())
+    return ""
 
 
-def exact_amount_match(text: str, expected: float):
-    target = round(float(expected), 2)
-    vals = extract_amounts(text)
-    return any(v == target for v in vals)
-
-
-def extract_txn_id(text: str) -> str:
-    m = re.search(r"transaction\s*id\s*[:\-]?\s*([A-Z0-9]{8,})", text, re.IGNORECASE)
-    return m.group(1) if m else ""
-
-
-def post_confirm(confirm_url: str, payload: dict):
+def post_confirm(url, payload):
+    data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        confirm_url,
-        data=json.dumps(payload).encode("utf-8"),
+        url,
+        data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        body = resp.read().decode("utf-8", errors="ignore")
-        return resp.status, body
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            try:
+                j = json.loads(body)
+            except Exception:
+                j = {}
+            return resp.status, j, body
+    except urllib.error.HTTPError as e:
+        return e.code, {}, e.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        return 0, {}, str(e)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--payment-id", required=True)
-    parser.add_argument("--username", required=True)
-    parser.add_argument("--amount", required=True, type=float)
-    parser.add_argument("--expires-at", required=True, type=int)
-    parser.add_argument(
-        "--max-runtime-sec",
-        required=False,
-        type=int,
-        default=int(os.getenv("PY_WATCHER_MAX_RUNTIME_SEC", "240")),
-    )
-    args = parser.parse_args()
-
-    gmail_user = os.getenv("GMAIL_IMAP_USER", "").strip()
-    gmail_pass = os.getenv("GMAIL_IMAP_APP_PASSWORD", "").strip()
-    from_match = os.getenv("GMAIL_FROM_MATCH", "famapp.in,famapp").lower()
+    args = parse_args()
+    payment_id = args.payment_id.strip()
+    amount = args.amount.strip()
+    expires_at = int(args.expires_at.strip())
+    max_runtime = args.max_runtime_sec or int(os.getenv("PY_WATCHER_MAX_RUNTIME_SEC", "240"))
     interval = int(os.getenv("PY_WATCHER_INTERVAL_SEC", "8"))
     max_age_sec = int(os.getenv("GMAIL_MESSAGE_MAX_AGE_SEC", "30"))
-    confirm_url = os.getenv(
-        "AUTO_CONFIRM_URL",
-        "http://localhost:8888/.netlify/functions/auto-payment-confirm",
-    )
-    confirm_secret = os.getenv("AUTO_PAYMENT_CONFIRM_SECRET", "")
 
-    if not gmail_user or not gmail_pass or not confirm_secret:
-        log("missing env config; watcher exit")
-        return
+    imap_user = (os.getenv("GMAIL_IMAP_USER") or "").strip()
+    imap_pass = (os.getenv("GMAIL_IMAP_APP_PASSWORD") or "").strip()
+    confirm_url = (os.getenv("AUTO_CONFIRM_URL") or "").strip()
+    confirm_secret = (os.getenv("AUTO_PAYMENT_CONFIRM_SECRET") or "").strip()
+    from_match = os.getenv("GMAIL_FROM_MATCH", "famapp.in,famapp").lower()
+    from_tokens = [t.strip() for t in from_match.split(",") if t.strip()]
 
-    started_at_ms = int(time.time() * 1000)
-    hard_deadline_ms = started_at_ms + max(30, int(args.max_runtime_sec)) * 1000
-    effective_expires_at = hard_deadline_ms
+    if not imap_user or not imap_pass:
+        print("Missing IMAP credentials", flush=True)
+        return 1
+    if not confirm_url:
+        print("Missing AUTO_CONFIRM_URL", flush=True)
+        return 1
 
-    log(
-        f"start paymentId={args.payment_id} user={args.username} amount={args.amount:.2f} "
-        f"deadline={effective_expires_at}"
-    )
-    from_tokens = [x.strip() for x in from_match.split(",") if x.strip()]
-    keywords = ["received", "credited", "famx account", "famapp"]
-    amount_set = amount_variants(args.amount)
-    consecutive_errors = 0
-    while int(time.time() * 1000) < effective_expires_at:
+    start_ts = int(time.time() * 1000)
+    hard_deadline = min(expires_at, start_ts + max_runtime * 1000)
+
+    log(f"[watcher] start payment_id={payment_id} amount={amount}")
+
+    while int(time.time() * 1000) < hard_deadline:
         try:
-            min_allowed_ts = int(time.time() * 1000) - (max_age_sec * 1000)
-            min_allowed_ts = max(min_allowed_ts, started_at_ms - 5000)
             imap = imaplib.IMAP4_SSL("imap.gmail.com")
-            imap.login(gmail_user, gmail_pass)
+            imap.login(imap_user, imap_pass)
             imap.select("INBOX")
-            status, data = imap.search(None, "ALL")
+
+            since_date = (dt.datetime.utcnow() - dt.timedelta(days=2)).strftime("%d-%b-%Y")
+            status, data = imap.search(None, f'(SINCE {since_date})')
             if status != "OK":
-                log("imap search failed")
+                log("[watcher] IMAP search failed")
                 imap.logout()
-                backoff = min(20, max(1, interval) + (consecutive_errors * 2))
-                jitter = random.uniform(0, 1.25)
-                time.sleep(backoff + jitter)
+                time.sleep(interval)
                 continue
 
-            ids = data[0].split()[-25:]
-            ids.reverse()
+            msg_ids = data[0].split()
+            msg_ids = msg_ids[-30:]  # limit last 30 messages
 
-            for mail_id in ids:
-                st, msg_data = imap.fetch(mail_id, "(RFC822)")
-                if st != "OK" or not msg_data or not msg_data[0]:
+            min_ts = max(int(time.time() * 1000) - max_age_sec * 1000, start_ts - 5000)
+
+            for msg_id in reversed(msg_ids):
+                status, parts = imap.fetch(msg_id, "(RFC822)")
+                if status != "OK" or not parts:
                     continue
 
-                raw = msg_data[0][1]
-                msg = email.message_from_bytes(raw)
-                from_val = decode_mime(msg.get("From", "")).lower()
-                subject = decode_mime(msg.get("Subject", ""))
-                body = extract_text(msg)
-                full = f"{subject}\n{body}"
-                low = full.lower()
-                try:
-                    msg_dt = parsedate_to_datetime(msg.get("Date", ""))
-                    msg_ts = int(msg_dt.timestamp() * 1000)
-                    if msg_ts < min_allowed_ts:
+                msg = email.message_from_bytes(parts[0][1])
+                subject = decode_mime_words(msg.get("Subject", ""))
+                sender = decode_mime_words(msg.get("From", ""))
+
+                if from_tokens:
+                    sender_l = sender.lower()
+                    if not any(t in sender_l for t in from_tokens):
                         continue
-                except Exception:
+
+                msg_date = msg.get("Date")
+                if msg_date:
+                    try:
+                        dt_obj = parsedate_to_datetime(msg_date)
+                        if dt_obj.tzinfo:
+                            msg_ts = int(dt_obj.timestamp() * 1000)
+                        else:
+                            msg_ts = int(dt_obj.replace(tzinfo=dt.timezone.utc).timestamp() * 1000)
+                        if msg_ts < min_ts:
+                            continue
+                    except Exception:
+                        pass
+
+                body_text = extract_text_from_message(msg)
+                combined = "\n".join([subject, sender, body_text])
+
+                if not amount_matches(combined, amount):
+                    continue
+                if not message_looks_like_credit(combined):
                     continue
 
-                if from_tokens and not any(tok in from_val for tok in from_tokens):
-                    continue
-                if not any(k in low for k in keywords):
-                    continue
-                if not contains_amount(full, amount_set):
-                    continue
-                if not exact_amount_match(full, args.amount):
-                    continue
+                txn_id = extract_txn_id(combined)
+                snippet = (body_text or "")[:180]
 
-                txn_id = extract_txn_id(full)
                 payload = {
-                    "paymentId": args.payment_id,
-                    "secret": confirm_secret,
+                    "paymentId": payment_id,
                     "txnId": txn_id,
+                    "snippet": snippet,
                     "subject": subject[:180],
-                    "snippet": body[:200],
-                    "senderEmail": from_val[:180],
+                    "senderEmail": sender[:180],
                 }
-                status_code, _ = post_confirm(confirm_url, payload)
-                log(f"match found, confirm status={status_code}, txn={txn_id or '-'}")
+                if confirm_secret:
+                    payload["confirmToken"] = confirm_secret
+                else:
+                    payload["secret"] = ""
+
+                status_code, j, raw = post_confirm(confirm_url, payload)
+                if status_code == 200 and j.get("success"):
+                    log(f"[watcher] confirmed payment_id={payment_id} txn={txn_id}")
+                    imap.logout()
+                    return 0
+
+                log(f"[watcher] confirm failed status={status_code} body={raw[:120]}")
                 imap.logout()
-                if status_code == 200:
-                    log("confirm success; watcher exit")
-                    return
-                break
+                return 1
 
             imap.logout()
-            consecutive_errors = 0
         except Exception as e:
-            consecutive_errors += 1
-            log(f"error: {e}")
+            log(f"[watcher] error: {e}")
 
-        backoff = min(20, max(1, interval) + (consecutive_errors * 2))
-        jitter = random.uniform(0, 1.25)
-        time.sleep(backoff + jitter)
+        time.sleep(interval)
 
-    log("expired/timeout without match")
+    log("[watcher] timeout reached")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
