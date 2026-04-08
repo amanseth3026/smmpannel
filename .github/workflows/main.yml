@@ -1,0 +1,71 @@
+name: Run Gmail Watcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      payment_id:
+        description: "Firestore payment doc id"
+        required: true
+        type: string
+      username:
+        description: "Panel username"
+        required: true
+        type: string
+      amount:
+        description: "Exact payable amount (e.g. 10.54)"
+        required: true
+        type: string
+      expires_at:
+        description: "Expiry timestamp in ms"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: watcher-${{ github.event.inputs.payment_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  watcher:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    environment: .env
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate files and inputs
+        run: |
+          test -f gmail_auto_watcher.py
+          test -n "${{ github.event.inputs.payment_id }}"
+          test -n "${{ github.event.inputs.username }}"
+          test -n "${{ github.event.inputs.amount }}"
+          test -n "${{ github.event.inputs.expires_at }}"
+
+      - name: Run watcher
+        env:
+          GMAIL_IMAP_USER: ${{ secrets.GMAIL_IMAP_USER }}
+          GMAIL_IMAP_APP_PASSWORD: ${{ secrets.GMAIL_IMAP_APP_PASSWORD }}
+          AUTO_PAYMENT_CONFIRM_SECRET: ${{ secrets.AUTO_PAYMENT_CONFIRM_SECRET }}
+          AUTO_CONFIRM_URL: ${{ secrets.AUTO_CONFIRM_URL }}
+
+          GMAIL_FROM_MATCH: "famapp.in,famapp,smm support team"
+          GMAIL_MESSAGE_MAX_AGE_SEC: "30"
+          PY_WATCHER_INTERVAL_SEC: "8"
+          PY_WATCHER_MAX_RUNTIME_SEC: "240"
+          PY_WATCHER_LOG: "true"
+        run: |
+          python -u gmail_auto_watcher.py \
+            --payment-id "${{ github.event.inputs.payment_id }}" \
+            --username "${{ github.event.inputs.username }}" \
+            --amount "${{ github.event.inputs.amount }}" \
+            --expires-at "${{ github.event.inputs.expires_at }}" \
+            --max-runtime-sec 240
